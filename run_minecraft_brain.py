@@ -377,27 +377,34 @@ class FastMinecraftBridge:
                                 for bx, by, bz in coords:
                                     dist = math.hypot(bx - fx, bz - fz)
                                     total_dist = math.hypot(dist, by - fy)
-
-                                    # Ground surface tracking
-                                    if btype not in NON_SOLID_PERCH and not btype.endswith("_propagule") and not btype.endswith("_sapling"):
+                                    # Ground surface tracking: only terrain blocks (exclude elevated canopy leaves, logs, or roofs)
+                                    is_elevated_structure = (
+                                        btype.endswith("_leaves") or
+                                        btype.endswith("_sapling") or
+                                        btype.endswith("_propagule") or
+                                        btype.endswith("_vine") or
+                                        btype.endswith("_vines") or
+                                        (by > fy + 1.5)  # Any block >1.5m above fly is overhead canopy, NOT ground!
+                                    )
+                                    if btype not in NON_SOLID_PERCH and not is_elevated_structure:
                                         ix, iz = int(round(bx)), int(round(bz))
                                         top_y = by + 1.0
                                         if (ix, iz) not in self.heightmap or top_y > self.heightmap[(ix, iz)]:
                                             self.heightmap[(ix, iz)] = top_y
 
-                                        # Canopy / shelter detection: tree leaves, logs, wood, roofs, building blocks
-                                        is_canopy = (
-                                            btype.endswith("_leaves") or
-                                            btype.endswith("_log") or
-                                            btype.endswith("_wood") or
-                                            btype.endswith("_planks") or
-                                            btype.endswith("_slab") or
-                                            btype.endswith("_stairs") or
-                                            "roof" in btype or
-                                            (btype not in NON_SOLID_PERCH and not btype.endswith("_flower") and by >= fy + 0.3)
-                                        )
-                                        if is_canopy:
-                                            self.known_shelters[(int(round(bx)), int(round(by)), int(round(bz)))] = time.time()
+                                    # Canopy / shelter detection: tree leaves, logs, wood, roofs, building blocks
+                                    is_canopy = (
+                                        btype.endswith("_leaves") or
+                                        btype.endswith("_log") or
+                                        btype.endswith("_wood") or
+                                        btype.endswith("_planks") or
+                                        btype.endswith("_slab") or
+                                        btype.endswith("_stairs") or
+                                        "roof" in btype or
+                                        (btype not in NON_SOLID_PERCH and not btype.endswith("_flower") and by >= fy + 0.3)
+                                    )
+                                    if is_canopy:
+                                        self.known_shelters[(int(round(bx)), int(round(by)), int(round(bz)))] = time.time()
 
                                     # Thermal hazards
                                     if btype in HAZARD_BLOCKS:
@@ -415,8 +422,8 @@ class FastMinecraftBridge:
                                         if min_food is None or total_dist < min_food[0]:
                                             min_food = (total_dist, bx, by, bz, val, fname)
 
-                                    # Solid perch candidate (top surface at by + 1.0)
-                                    if btype not in NON_SOLID_PERCH and (by <= fy + 0.5):
+                                    # Solid perch candidate (top surface at by + 1.0, exclude leaves so fly doesn't perch on top of tree)
+                                    if btype not in NON_SOLID_PERCH and not btype.endswith("_leaves") and (by <= fy + 0.5):
                                         perch_top_y = by + 1.0
                                         pdist = math.hypot(bx - fx, bz - fz)
                                         if min_perch is None or pdist < min_perch[0]:
@@ -452,7 +459,8 @@ class FastMinecraftBridge:
                         for (sx, sz), y_list in col_canopies.items():
                             pdist = math.hypot(sx - fx, sz - fz)
                             lowest_y = min(y_list)
-                            target_canopy_y = max(lowest_y - 0.5, self.get_ground_y(sx, sz, fy) + 0.3)
+                            ground_at_col = self.get_ground_y(sx, sz, fy - 1.5)
+                            target_canopy_y = min(lowest_y - 0.6, max(ground_at_col + 0.4, lowest_y - 0.9))
                             if min_shelter is None or pdist < min_shelter[0]:
                                 min_shelter = (pdist, float(sx), float(target_canopy_y), float(sz))
 
@@ -777,6 +785,9 @@ class AerodynamicFlyAgent:
             self.vx = self.vy = self.vz = 0.0
             if self.is_walking:
                 self.y = ground_y
+            elif is_raining and is_sheltered and nearest_shelter is not None:
+                safe_canopy_y = nearest_shelter[2]
+                self.y = max(ground_y + 0.20, min(self.y, safe_canopy_y))
 
             # Small micro-yaw grooming jitters
             self.yaw = (self.yaw + random.uniform(-1.5, 1.5)) % 360.0
@@ -801,20 +812,20 @@ class AerodynamicFlyAgent:
                 self.grooming_tick = 0
                 self.flight_energy = 100.0
                 if not self.is_walking:
-                    self.vy = 0.12
+                    self.vy = 0.0 if (is_raining and is_sheltered) else 0.08
                 self.pitch = 0.0
-                active_state = "SHELTERED (Resting from Rain)" if (is_raining and is_sheltered) else "FORAGING"
+                active_state = "SHELTERED (Safe from Rain)" if (is_raining and is_sheltered) else "FORAGING"
 
             return self.x, self.y, self.z, self.yaw, self.pitch, active_state
 
         # Check if needs grooming (energy low < 15.0 or random pause) when not in urgent state
-        if (self.flight_energy < 15.0 or (tick % 600 == 0 and random.random() < 0.35)) and not is_escape and food_valence <= 0 and not is_seeking_shelter and self.annoyed_jump_ticks <= 0:
+        if (self.flight_energy < 15.0 or (tick % 600 == 0 and random.random() < 0.35)) and not is_escape and food_valence <= 0 and not is_seeking_shelter and not (is_raining and not is_sheltered) and self.annoyed_jump_ticks <= 0:
             if self.is_walking:
                 self.is_grooming = True
                 self.grooming_tick = 0
                 self.vx = self.vy = self.vz = 0.0
                 return self.x, self.y, self.z, self.yaw, self.pitch, "GROOMING: Antennae"
-            elif nearest_perch is not None and nearest_perch[0] < 5.0:
+            elif nearest_perch is not None and nearest_perch[0] < 5.0 and not is_raining:
                 _, per_x, per_y, per_z = nearest_perch
                 pdist = math.hypot(per_x - self.x, per_z - self.z)
                 if pdist < 0.7 and abs(self.y - per_y) < 0.6:
