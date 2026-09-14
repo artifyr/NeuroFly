@@ -122,7 +122,9 @@ FOOD_BLOCKS: Dict[str, Tuple[float, str]] = {
 NON_SOLID_PERCH = {
     "minecraft:air", "minecraft:cave_air", "minecraft:void_air", "minecraft:water",
     "minecraft:lava", "minecraft:fire", "minecraft:soul_fire", "minecraft:short_grass",
-    "minecraft:tall_grass", "minecraft:fern", "minecraft:large_fern",
+    "minecraft:tall_grass", "minecraft:fern", "minecraft:large_fern", "minecraft:vine",
+    "minecraft:cave_vines", "minecraft:twisting_vines", "minecraft:weeping_vines",
+    "minecraft:seagrass", "minecraft:tall_seagrass", "minecraft:kelp", "minecraft:kelp_plant",
 }
 
 
@@ -155,6 +157,7 @@ class FastMinecraftBridge:
         self.nearest_perch: Optional[Tuple[float, float, float, float]] = None        # (dist, x, top_y, z)
         self.nearest_shelter: Optional[Tuple[float, float, float, float]] = None      # (dist, x, y, z)
         self.is_sheltered: bool = False
+        self.known_shelters: Dict[Tuple[int, int, int], float] = {}  # (bx, by, bz) -> last_seen_time
         self.heightmap: Dict[Tuple[int, int], float] = {}
 
         self._stop_bg = False
@@ -194,17 +197,33 @@ class FastMinecraftBridge:
             import os
             import shutil
             import subprocess
-            jdk_java = os.environ.get("JAVA_HOME", "")
-            if jdk_java:
-                candidate = os.path.join(jdk_java, "bin", "java.exe" if sys.platform == "win32" else "java")
-                jdk_java = candidate if os.path.exists(candidate) else (shutil.which("java") or "java")
-            else:
-                jdk_java = shutil.which("java") or "java"
+            ps_info = "(Get-Process javaw -ErrorAction SilentlyContinue | Select-Object -First 1 Id, Path | ConvertTo-Json)"
+            ps_out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_info]).decode().strip()
+            pid = None
+            jdk_java = "java"
+            if ps_out:
+                try:
+                    proc_info = json.loads(ps_out)
+                    pid = str(proc_info.get("Id", ""))
+                    javaw_path = proc_info.get("Path", "")
+                    if javaw_path:
+                        cand = os.path.join(os.path.dirname(javaw_path), "java.exe" if sys.platform == "win32" else "java")
+                        if os.path.exists(cand):
+                            jdk_java = cand
+                except Exception:
+                    pass
+
+            if jdk_java == "java":
+                jdk_env = os.environ.get("JAVA_HOME", "")
+                if jdk_env:
+                    cand = os.path.join(jdk_env, "bin", "java.exe" if sys.platform == "win32" else "java")
+                    if os.path.exists(cand):
+                        jdk_java = cand
+                else:
+                    jdk_java = shutil.which("java") or "java"
 
             if dt > 100.0:
                 print(f"[!] Warning: MCP command latency is high ({dt:.1f}ms). Auto-hotreloading CommandExecutor...")
-                ps_cmd = "(Get-Process javaw -ErrorAction SilentlyContinue).Id"
-                pid = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_cmd]).decode().strip()
                 if pid:
                     subprocess.run(
                         [jdk_java, "-cp", "scratch", "AttachSingle", pid, "scratch/agent.jar", "scratch/CommandExecutor.class"],
@@ -221,8 +240,6 @@ class FastMinecraftBridge:
             content_str = info_res.get("result", {}).get("content", [{}])[0].get("text", "{}")
             if content_str and "isRaining" not in content_str:
                 print("[!] In-memory PlayerInfoProvider lacks 'isRaining'. Auto-patching live JVM...")
-                ps_cmd = "(Get-Process javaw -ErrorAction SilentlyContinue).Id"
-                pid = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps_cmd]).decode().strip()
                 if pid:
                     subprocess.run(
                         [jdk_java, "-cp", "scratch", "Attach", pid, "scratch/live_agent.jar", "cuspymd.mcp.mod.utils.PlayerInfoProvider", "scratch/out/cuspymd/mcp/mod/utils/PlayerInfoProvider.class"],
@@ -288,92 +305,125 @@ class FastMinecraftBridge:
                     # 2. Periodically scan block volume around fly (every ~1.0s)
                     if iteration % 4 == 0:
                         fx, fy, fz = self.fly_approx_pos
-                        hradius = 8 if self.is_raining else 5
-                        y_up = 6 if self.is_raining else 3
-                        x1, y1, z1 = int(fx - hradius), int(fy - 2), int(fz - hradius)
-                        x2, y2, z2 = int(fx + hradius), int(fy + y_up), int(fz + hradius)
 
-                        payload_blocks = json.dumps({
-                            "jsonrpc": "2.0",
-                            "id": 9991,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "get_blocks_in_area",
-                                "arguments": {"from": {"x": x1, "y": y1, "z": z1}, "to": {"x": x2, "y": y2, "z": z2}}
-                            },
-                        })
-                        tracker_conn.request("POST", "/mcp", payload_blocks, self.headers)
-                        resp_b = tracker_conn.getresponse()
-                        data_b = json.loads(resp_b.read().decode("utf-8"))
-                        block_text = data_b.get("result", {}).get("content", [{}])[0].get("text", "{}")
-                        block_data = json.loads(block_text)
+                        # Determine scan boxes adhering strictly to MCP limit (<= 10 blocks per axis!)
+                        # We use 9x9x9 boxes. In rain, rotate through sectors to discover distant canopies.
+                        scan_offsets = [(0, 0)]
+                        if self.is_raining:
+                            quad = (iteration // 4) % 5
+                            if quad == 1:
+                                scan_offsets = [(5, 0)]
+                            elif quad == 2:
+                                scan_offsets = [(-5, 0)]
+                            elif quad == 3:
+                                scan_offsets = [(0, 5)]
+                            elif quad == 4:
+                                scan_offsets = [(0, -5)]
 
-                        # Parse blocks and build ground heightmap
                         min_hazard = None
                         min_light = None
                         min_food = None
                         min_perch = None
-                        min_shelter = None
-                        is_sheltered = False
-                        hmap: Dict[Tuple[int, int], float] = {}
 
-                        for b in block_data.get("blocks", []):
-                            btype = b.get("blockType", "")
-                            coords: List[Tuple[float, float, float]] = []
+                        for ox, oz in scan_offsets:
+                            cx, cz = fx + ox, fz + oz
+                            x1, y1, z1 = int(round(cx - 4)), int(round(fy - 2)), int(round(cz - 4))
+                            x2, y2, z2 = int(round(cx + 4)), int(round(fy + 6)), int(round(cz + 4))
 
-                            for sb in b.get("singleBlocks", []):
-                                coords.append((float(sb["x"]), float(sb["y"]), float(sb["z"])))
-                            for reg in b.get("regions", []):
-                                s, e = reg.get("start", {}), reg.get("end", {})
-                                sx, ex = min(s["x"], e["x"]), max(s["x"], e["x"])
-                                sy, ey = min(s["y"], e["y"]), max(s["y"], e["y"])
-                                sz, ez = min(s["z"], e["z"]), max(s["z"], e["z"])
-                                for rx in range(sx, ex + 1):
-                                    for ry in range(sy, ey + 1):
-                                        for rz in range(sz, ez + 1):
-                                            coords.append((float(rx), float(ry), float(rz)))
+                            # Safety clamp to guarantee strictly <= 10 blocks per axis
+                            if x2 - x1 >= 10:
+                                x2 = x1 + 9
+                            if y2 - y1 >= 10:
+                                y2 = y1 + 9
+                            if z2 - z1 >= 10:
+                                z2 = z1 + 9
 
-                            for bx, by, bz in coords:
-                                dist = math.hypot(bx - fx, bz - fz)
-                                total_dist = math.hypot(dist, by - fy)
+                            payload_blocks = json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": 9991,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "get_blocks_in_area",
+                                    "arguments": {"from": {"x": x1, "y": y1, "z": z1}, "to": {"x": x2, "y": y2, "z": z2}}
+                                },
+                            })
+                            tracker_conn.request("POST", "/mcp", payload_blocks, self.headers)
+                            resp_b = tracker_conn.getresponse()
+                            data_b = json.loads(resp_b.read().decode("utf-8"))
+                            block_text = data_b.get("result", {}).get("content", [{}])[0].get("text", "{}")
+                            block_data = json.loads(block_text)
 
-                                # Ground surface tracking
-                                if btype not in NON_SOLID_PERCH:
-                                    ix, iz = int(round(bx)), int(round(bz))
-                                    top_y = by + 1.0
-                                    if (ix, iz) not in hmap or top_y > hmap[(ix, iz)]:
-                                        hmap[(ix, iz)] = top_y
+                            # Parse blocks and build ground heightmap & canopy memory
+                            for b in block_data.get("blocks", []):
+                                btype = b.get("blockType", "")
+                                coords: List[Tuple[float, float, float]] = []
 
-                                    # Ceiling detection for rain avoidance: solid block overhead (by > fy + 0.6)
-                                    if by > fy + 0.6:
+                                for sb in b.get("singleBlocks", []):
+                                    coords.append((float(sb["x"]), float(sb["y"]), float(sb["z"])))
+                                for reg in b.get("regions", []):
+                                    s, e = reg.get("start", {}), reg.get("end", {})
+                                    sx, ex = min(s["x"], e["x"]), max(s["x"], e["x"])
+                                    sy, ey = min(s["y"], e["y"]), max(s["y"], e["y"])
+                                    sz, ez = min(s["z"], e["z"]), max(s["z"], e["z"])
+                                    for rx in range(sx, ex + 1):
+                                        for ry in range(sy, ey + 1):
+                                            for rz in range(sz, ez + 1):
+                                                coords.append((float(rx), float(ry), float(rz)))
+
+                                for bx, by, bz in coords:
+                                    dist = math.hypot(bx - fx, bz - fz)
+                                    total_dist = math.hypot(dist, by - fy)
+
+                                    # Ground surface tracking
+                                    if btype not in NON_SOLID_PERCH and not btype.endswith("_propagule") and not btype.endswith("_sapling"):
+                                        ix, iz = int(round(bx)), int(round(bz))
+                                        top_y = by + 1.0
+                                        if (ix, iz) not in self.heightmap or top_y > self.heightmap[(ix, iz)]:
+                                            self.heightmap[(ix, iz)] = top_y
+
+                                        # Shelter & Canopy tracking (overhead solid block / tree leaves / logs)
+                                        if by > fy + 0.6:
+                                            self.known_shelters[(int(round(bx)), int(round(by)), int(round(bz)))] = time.time()
+
+                                    # Thermal hazards
+                                    if btype in HAZARD_BLOCKS:
+                                        if min_hazard is None or total_dist < min_hazard[0]:
+                                            min_hazard = (total_dist, bx, by, bz, HAZARD_BLOCKS[btype])
+
+                                    # Light sources
+                                    if btype in LIGHT_BLOCKS:
+                                        if min_light is None or total_dist < min_light[0]:
+                                            min_light = (total_dist, bx, by, bz, LIGHT_BLOCKS[btype])
+
+                                    # World food blocks
+                                    if btype in FOOD_BLOCKS:
+                                        val, fname = FOOD_BLOCKS[btype]
+                                        if min_food is None or total_dist < min_food[0]:
+                                            min_food = (total_dist, bx, by, bz, val, fname)
+
+                                    # Solid perch candidate (top surface at by + 1.0)
+                                    if btype not in NON_SOLID_PERCH and (by <= fy + 0.5):
+                                        perch_top_y = by + 1.0
                                         pdist = math.hypot(bx - fx, bz - fz)
-                                        if pdist < 1.25:
-                                            is_sheltered = True
-                                        if min_shelter is None or pdist < min_shelter[0]:
-                                            min_shelter = (pdist, bx, by - 0.4, bz)
+                                        if min_perch is None or pdist < min_perch[0]:
+                                            min_perch = (pdist, bx, perch_top_y, bz)
 
-                                # Thermal hazards
-                                if btype in HAZARD_BLOCKS:
-                                    if min_hazard is None or total_dist < min_hazard[0]:
-                                        min_hazard = (total_dist, bx, by, bz, HAZARD_BLOCKS[btype])
+                        # Clean up known_shelters that are too distant (> 45m) or very stale (> 600s)
+                        now = time.time()
+                        stale_keys = [k for k, t in self.known_shelters.items() if (now - t > 600.0 or math.hypot(k[0] - fx, k[2] - fz) > 45.0)]
+                        for k in stale_keys:
+                            self.known_shelters.pop(k, None)
 
-                                # Light sources
-                                if btype in LIGHT_BLOCKS:
-                                    if min_light is None or total_dist < min_light[0]:
-                                        min_light = (total_dist, bx, by, bz, LIGHT_BLOCKS[btype])
-
-                                # World food blocks
-                                if btype in FOOD_BLOCKS:
-                                    val, fname = FOOD_BLOCKS[btype]
-                                    if min_food is None or total_dist < min_food[0]:
-                                        min_food = (total_dist, bx, by, bz, val, fname)
-
-                                # Solid perch candidate (top surface at by + 1.0)
-                                if btype not in NON_SOLID_PERCH and (by <= fy + 0.5):
-                                    perch_top_y = by + 1.0
-                                    pdist = math.hypot(bx - fx, bz - fz)
-                                    if min_perch is None or pdist < min_perch[0]:
-                                        min_perch = (pdist, bx, perch_top_y, bz)
+                        # Determine if fly is currently sheltered and find nearest shelter
+                        is_sheltered = False
+                        min_shelter = None
+                        for (sx, sy, sz) in self.known_shelters.keys():
+                            pdist = math.hypot(sx - fx, sz - fz)
+                            # Direct overhead check: block is directly above fly (by > fy + 0.5) and within 1.35m horizontal
+                            if pdist < 1.35 and sy > fy + 0.5:
+                                is_sheltered = True
+                            if min_shelter is None or pdist < min_shelter[0]:
+                                min_shelter = (pdist, float(sx), float(sy) - 0.4, float(sz))
 
                         self.nearest_hazard = min_hazard
                         self.nearest_light = min_light
@@ -381,7 +431,6 @@ class FastMinecraftBridge:
                         self.nearest_perch = min_perch
                         self.nearest_shelter = min_shelter
                         self.is_sheltered = is_sheltered
-                        self.heightmap = hmap
 
                 except Exception:
                     tracker_conn = http.client.HTTPConnection(self.host, self.port, timeout=3.0)
@@ -660,25 +709,29 @@ class AerodynamicFlyAgent:
         if is_raining and not is_escape:
             if not is_sheltered:
                 is_seeking_shelter = True
-                active_state = "SEEKING SHELTER (Rain Avoidance)"
+                active_state = "SEEKING SHELTER (Rain Pain!)"
                 if nearest_shelter is not None:
                     _, sx, sy, sz = nearest_shelter
                     dx = sx - self.x
                     dz = sz - self.z
                     angle_to_shelter = math.degrees(math.atan2(-dx, dz)) % 360.0
                     shelter_rel = (angle_to_shelter - self.yaw + 180.0) % 360.0 - 180.0
-                    shelter_steer = math.copysign(min(22.0, abs(shelter_rel) * 0.40), shelter_rel)
+                    shelter_steer = math.copysign(min(24.0, abs(shelter_rel) * 0.45), shelter_rel)
+                    # Fly towards shelter altitude (stay underneath canopy)
+                    target_y = max(ground_y + 0.3, min(self.y + 0.08, sy))
+                    self.y += max(-0.08, min(0.08, (target_y - self.y) * 0.25))
                 else:
-                    # In open field: stay low to ground and search for nearby cover
-                    shelter_steer = random.uniform(-5.0, 5.0)
+                    # In open field without known shelter: stay low and explore
+                    shelter_steer = random.uniform(-6.0, 6.0)
+                    self.y = max(ground_y + 0.6, self.y - 0.04)
             else:
                 # Under safe overhead cover (tree leaf canopy, cave roof, or building ceiling)
-                active_state = "SHELTERED (Resting from Rain)"
-                self.vx *= 0.50
-                self.vz *= 0.50
+                active_state = "SHELTERED (Safe from Rain)"
+                self.vx *= 0.40
+                self.vz *= 0.40
                 self.vy = 0.0
                 self.pitch = 2.0
-                if not self.is_grooming and random.random() < 0.04:
+                if not self.is_grooming and random.random() < 0.06:
                     self.is_grooming = True
                     self.grooming_tick = 0
 
@@ -819,7 +872,7 @@ class AerodynamicFlyAgent:
         elif is_avoiding_hazard:
             steer_target = hazard_steer
         elif is_seeking_shelter:
-            steer_target = shelter_steer
+            steer_target = shelter_steer + learned_steer * 0.5
         elif self.annoyed_jump_ticks > 0:
             active_state = "ANNOYED (Sound/Touch!)"
             steer_target = random.uniform(-4.0, 4.0)
@@ -1328,6 +1381,33 @@ def main():
                 pain_current = snn.inject_pain(intensity=1.0, threat_rel_angle=threat_rel_angle, world_heading=flight.yaw)
                 ext_current = ext_current + pain_current
 
+            # Rain Nociception & Conditioned Shelter Seeking
+            if is_raining:
+                if not is_sheltered:
+                    # Calculate relative angle towards nearest shelter (if known)
+                    shelter_rel = None
+                    if nearest_shelter is not None:
+                        _, sx, sy, sz = nearest_shelter
+                        _, shelter_rel, _ = flight.compute_target_relative_vector(sx, sy, sz)
+
+                    # Nociceptive rain droplet bombardment + mushroom body threat conditioning
+                    rain_pain_cur = snn.inject_rain_pain(
+                        intensity=1.0,
+                        shelter_rel_angle=shelter_rel,
+                        world_heading=flight.yaw,
+                    )
+                    ext_current = ext_current + rain_pain_cur
+
+                    # Mechanical rain damage when exposed (droplet impact trauma)
+                    if tick % 30 == 0:
+                        fly_health = max(1.0, fly_health - 1.0)
+                else:
+                    # Safe under cover: relief reward dopamine (PAM reinforcement)
+                    shelter_relief_cur = snn.inject_shelter_relief()
+                    ext_current = ext_current + shelter_relief_cur
+                    if tick % 30 == 0:
+                        fly_health = min(max_health, fly_health + 0.5)
+
             # Feeding Nutrient Regeneration
             if is_feeding and tick % 15 == 0:
                 fly_health = min(max_health, fly_health + 1.0)
@@ -1337,7 +1417,7 @@ def main():
                 for act in streamer.pop_actions():
                     action_name = act.get("action")
                     intensity = float(act.get("intensity", 1.0))
-                    if action_name in ("inject_sweet", "inject_looming", "inject_pain", "inject_odor", "inject_sound_touch"):
+                    if action_name in ("inject_sweet", "inject_looming", "inject_pain", "inject_rain_pain", "inject_odor", "inject_sound_touch"):
                         flight.is_sleeping = False
                         flight.is_landed = flight.is_walking
                         snn.set_circadian_phase(is_night=False)
@@ -1436,7 +1516,9 @@ def main():
                     state_col = "light_purple"
                 elif "HUNGRY" in current_state_label:
                     state_col = "gold"
-                elif "SHELTER" in current_state_label:
+                elif "SEEKING SHELTER" in current_state_label:
+                    state_col = "red"
+                elif "SHELTERED" in current_state_label:
                     state_col = "blue"
                 elif "PHOTOTAXIS" in current_state_label:
                     state_col = "yellow"

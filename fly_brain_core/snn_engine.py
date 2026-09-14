@@ -218,6 +218,90 @@ class FlyBrainSNN(nn.Module):
 
         return pain_current
 
+    def inject_rain_pain(
+        self,
+        intensity: float = 1.0,
+        shelter_rel_angle: Optional[float] = None,
+        world_heading: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        Biological Rain Impact Nociception & Mushroom Body Conditioned Avoidance:
+        - Raindrop mechanical impacts violently stimulate cuticular mechanonociceptors.
+        - Firing of PPL1-cluster aversive DANs spikes dopamine into punishment state.
+        - Negative reinforcement: Conditioned avoidance in Mushroom Body (threat_memory).
+          Exposed heading vectors are stamped as dangerous. If shelter direction is known,
+          headings pointing away from shelter receive steep punishment, driving learned
+          steering towards the safe shelter vector.
+        - Descending motor activation drives escape flight towards shelter.
+        """
+        rain_current = torch.zeros((self.num_neurons,), dtype=torch.float32, device=self.device)
+        self.dopamine_level = min(1.0, self.dopamine_level + intensity * 0.45)
+        self.escape_timer = max(self.escape_timer, int(8 * intensity))
+
+        if self.is_sleeping:
+            self.is_sleeping = False
+            self.v_thresh = self.base_v_thresh
+            self.synaptic_gain = self.base_synaptic_gain
+
+        # 1. Nociceptive sensory neurons (cuticular mechanonociceptor bombardment)
+        if len(self.connectome.nociceptive_indices) > 0:
+            rain_current[self.connectome.nociceptive_indices] = 42.0 * intensity
+
+        # 2. Aversive DANs (PPL1 cluster punishment dopamine)
+        if len(self.connectome.dopamine_indices) > 0:
+            rain_current[self.connectome.dopamine_indices] = 35.0 * intensity
+
+        # 3. Descending motor steering towards shelter (or rapid avoidance flinch)
+        if len(self.connectome.motor_indices) > 0:
+            rain_current[self.connectome.motor_indices] += 14.0 * intensity
+
+        if shelter_rel_angle is not None:
+            # Steer TOWARDS the shelter (if shelter is left, fire left motor; if right, fire right)
+            steer_strength = 24.0 * intensity
+            if shelter_rel_angle < 0:
+                if len(self.connectome.motor_left_indices) > 0:
+                    rain_current[self.connectome.motor_left_indices] += steer_strength
+            else:
+                if len(self.connectome.motor_right_indices) > 0:
+                    rain_current[self.connectome.motor_right_indices] += steer_strength
+
+            # Condition Mushroom Body: punish all headings pointing AWAY from shelter
+            shelter_world_heading = (world_heading + shelter_rel_angle) % 360.0
+            opposite_heading = (shelter_world_heading + 180.0) % 360.0
+            for d in range(-60, 61):
+                idx = int(opposite_heading + d) % 360
+                decay_factor = 1.0 - abs(d) / 75.0
+                self.threat_memory[idx] = min(1.0, self.threat_memory[idx].item() + 0.5 * intensity * decay_factor)
+        else:
+            # No shelter known yet: open sky exposure stamps current heading as dangerous
+            h_deg = int(world_heading) % 360
+            for d in range(-45, 46):
+                idx = (h_deg + d) % 360
+                self.threat_memory[idx] = min(1.0, self.threat_memory[idx].item() + 0.4 * intensity)
+
+        return rain_current
+
+    def inject_shelter_relief(self) -> torch.Tensor:
+        """
+        Shelter Entry Relief & Negative Reinforcement Reward:
+        - When rain droplet nociception ceases under canopy/roof cover, the relief
+          from punishment acts as positive reinforcement (PAM dopamine cluster activation).
+        - Soothes aversive dopamine and promotes resting/grooming state.
+        """
+        relief_current = torch.zeros((self.num_neurons,), dtype=torch.float32, device=self.device)
+        self.dopamine_level = max(0.0, self.dopamine_level - 0.05)
+        self.escape_timer = 0
+
+        # Activate PAM appetitive dopamine reward neurons (relief reward)
+        if len(self.connectome.dopamine_indices) > 0:
+            relief_current[self.connectome.dopamine_indices] = 15.0
+
+        # Sub-threshold forward quieting
+        if len(self.connectome.motor_indices) > 0:
+            relief_current[self.connectome.motor_indices] += 2.0
+
+        return relief_current
+
     def inject_food_odor(
         self,
         valence: float = 1.0,

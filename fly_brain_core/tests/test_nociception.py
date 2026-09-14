@@ -62,3 +62,45 @@ def test_learned_avoidance_memory(test_snn):
     # Approaching 90 degrees now triggers avoidance steer
     steer = test_snn.get_learned_avoidance_steer(90.0)
     assert abs(steer) > 0.0
+
+
+def test_rain_pain_depolarization_and_dopamine(test_snn):
+    """Verify rain pain depolarizes nociceptors and elevates punishment dopamine."""
+    assert test_snn.dopamine_level == 0.0
+    rain_current = test_snn.inject_rain_pain(intensity=1.0, world_heading=45.0)
+
+    assert rain_current.shape == (test_snn.num_neurons,)
+    assert rain_current.sum() > 0.0
+    assert test_snn.dopamine_level > 0.3
+    assert test_snn.threat_memory[45].item() > 0.2
+
+    spikes = test_snn.step(rain_current)
+    assert spikes.sum() > 0
+
+
+def test_rain_shelter_conditioned_avoidance(test_snn):
+    """
+    When rain pain is received with shelter on the LEFT (-45 deg from heading 0),
+    headings facing AWAY from shelter (opposite heading ~135 deg) are punished in Mushroom Body.
+    Approaching the dangerous open direction generates learned avoidance steering away from danger.
+    """
+    test_snn.inject_rain_pain(intensity=1.0, shelter_rel_angle=-45.0, world_heading=0.0)
+
+    # Heading facing away from shelter is conditioned as dangerous
+    steer = test_snn.get_learned_avoidance_steer(135.0)
+    assert abs(steer) > 0.0
+
+
+def test_shelter_relief_suppresses_punishment(test_snn):
+    """
+    Moving under shelter halts nociceptive pain and releases relief dopamine,
+    soothing aversive punishment levels.
+    """
+    test_snn.inject_rain_pain(intensity=1.0, world_heading=0.0)
+    dopamine_after_rain = test_snn.dopamine_level
+
+    relief_current = test_snn.inject_shelter_relief()
+    assert relief_current.shape == (test_snn.num_neurons,)
+    assert test_snn.dopamine_level < dopamine_after_rain
+    assert not test_snn.is_escaping
+
