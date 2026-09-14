@@ -114,6 +114,37 @@ public class PlayerInfoProvider implements IPlayerInfoProvider {
 
         playerInfo.add("inventory", inventory);
 
+        com.google.gson.JsonArray nearbyEntities = new com.google.gson.JsonArray();
+        if (world instanceof net.minecraft.client.multiplayer.ClientLevel clientLevel) {
+            for (net.minecraft.world.entity.Entity entity : clientLevel.entitiesForRendering()) {
+                if (entity == null || entity == player) continue;
+                String typeStr = entity.getType().toShortString();
+                if (typeStr.contains("item") || typeStr.contains("arrow") || typeStr.contains("experience_orb") || 
+                    typeStr.contains("marker") || typeStr.contains("area_effect_cloud") || typeStr.contains("falling_block")) {
+                    continue;
+                }
+                double ex = entity.getX();
+                double ey = entity.getY();
+                double ez = entity.getZ();
+                double dx = ex - player.getX();
+                double dy = ey - player.getY();
+                double dz = ez - player.getZ();
+                double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist <= 30.0) {
+                    JsonObject entObj = new JsonObject();
+                    entObj.addProperty("id", Integer.valueOf(entity.getId()));
+                    entObj.addProperty("type", typeStr);
+                    entObj.addProperty("name", entity.getName().getString());
+                    entObj.addProperty("x", Double.valueOf(ex));
+                    entObj.addProperty("y", Double.valueOf(ey));
+                    entObj.addProperty("z", Double.valueOf(ez));
+                    entObj.addProperty("dist", Double.valueOf(dist));
+                    nearbyEntities.add(entObj);
+                }
+            }
+        }
+        playerInfo.add("nearbyEntities", nearbyEntities);
+
         return playerInfo;
     }
 

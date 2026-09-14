@@ -173,10 +173,51 @@ def test_two_line_hud_lengths():
     print("[PASS] Two-Line Actionbar HUD lengths verified successfully!\n")
 
 
+def test_mob_threat_and_shelter_grooming_escape():
+    print("=== Testing Mob Threat Perception & Shelter Grooming Escape ===")
+    agent = AerodynamicFlyAgent(0.0, 5.0, 0.0, is_walking=False)
+    agent.x = 0.0
+    agent.y = 5.0
+    agent.z = 0.0
+    agent.yaw = 0.0
+
+    # 1. Nearby mob detection (Zombie within 1.8m in front)
+    nearby_mobs = [{"id": 42, "type": "zombie", "x": 0.0, "y": 5.0, "z": 1.8}]
+    is_threat, rel_angle = agent.detect_looming_threat(px=50.0, py=50.0, pz=50.0, nearby_mobs=nearby_mobs)
+    assert is_threat is True, "Nearby zombie within 1.8m should trigger looming threat!"
+    assert agent.shelter_groom_cooldown == 120, "Threat should set shelter groom cooldown!"
+
+    # 2. While sheltered in rain and grooming, an escape signal or threat immediately cancels grooming
+    agent.is_grooming = True
+    agent.grooming_tick = 50
+    _, _, _, _, _, state_escape = agent.step_behavior_and_physics(
+        turn_signal=0.0, forward_signal=0.0, learned_steer=0.0,
+        px=50.0, py=50.0, pz=50.0, tick=1, ground_y=0.0,
+        is_escape=True, is_raining=True, is_sheltered=True
+    )
+    assert agent.is_grooming is False, "Escape signal must immediately abort grooming!"
+    assert "GROOMING" not in state_escape and "SHELTERED: " not in state_escape, "State must not be grooming during escape!"
+
+    # 3. Complete grooming cycle under shelter transitions to resting state (no infinite loop)
+    agent.is_grooming = True
+    agent.grooming_tick = 109
+    _, _, _, _, _, state_rest = agent.step_behavior_and_physics(
+        turn_signal=0.0, forward_signal=0.0, learned_steer=0.0,
+        px=50.0, py=50.0, pz=50.0, tick=2, ground_y=0.0,
+        is_escape=False, is_raining=True, is_sheltered=True
+    )
+    assert agent.is_grooming is False, "Grooming must terminate at tick 110!"
+    assert agent.shelter_groom_cooldown > 0, "Shelter groom cooldown must be positive to prevent immediate re-grooming loop!"
+    assert state_rest == "SHELTERED (Resting from Rain)", f"Expected sheltered rest state, got '{state_rest}'"
+    print("[PASS] Mob threat & shelter grooming escape verified successfully!\n")
+
+
 if __name__ == "__main__":
     test_rear_blind_spot()
     test_johnstons_organ_sound_touch()
     test_energy_pool_and_hunger()
     test_rain_avoidance()
     test_two_line_hud_lengths()
-    print("ALL 5 VERIFICATION TESTS PASSED PERFECTLY!")
+    test_mob_threat_and_shelter_grooming_escape()
+    print("ALL 6 VERIFICATION TESTS PASSED PERFECTLY!")
+

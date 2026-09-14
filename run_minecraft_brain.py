@@ -148,6 +148,7 @@ class FastMinecraftBridge:
         self.is_day: bool = True
         self.is_night: bool = False
         self.is_raining: bool = False
+        self.nearby_entities: List[Dict[str, Any]] = []
 
         # Environment scan results
         self.fly_approx_pos: Tuple[float, float, float] = (-38.0, -58.0, 175.0)
@@ -235,11 +236,11 @@ class FastMinecraftBridge:
             else:
                 print(f"[OK] MCP Command latency verified: {dt:.1f}ms (Ultra-smooth 20Hz physics enabled).")
 
-            # Verify rain & weather reporting in PlayerInfoProvider
+            # Verify rain, weather & nearby entities reporting in PlayerInfoProvider
             info_res = self._call("tools/call", {"name": "get_player_info", "arguments": {}})
             content_str = info_res.get("result", {}).get("content", [{}])[0].get("text", "{}")
-            if content_str and "isRaining" not in content_str:
-                print("[!] In-memory PlayerInfoProvider lacks 'isRaining'. Auto-patching live JVM...")
+            if content_str and ("isRaining" not in content_str or "nearbyEntities" not in content_str):
+                print("[!] In-memory PlayerInfoProvider lacks 'isRaining' or 'nearbyEntities'. Auto-patching live JVM...")
                 if pid:
                     subprocess.run(
                         [jdk_java, "-cp", "scratch", "Attach", pid, "scratch/live_agent.jar", "cuspymd.mcp.mod.utils.PlayerInfoProvider", "scratch/out/cuspymd/mcp/mod/utils/PlayerInfoProvider.class"],
@@ -247,7 +248,7 @@ class FastMinecraftBridge:
                         capture_output=True,
                         timeout=5
                     )
-                    print(f"[OK] In-memory PlayerInfoProvider hot-reloaded for PID {pid} (Live rain detection enabled)!")
+                    print(f"[OK] In-memory PlayerInfoProvider hot-reloaded for PID {pid} (Live rain & mob detection enabled)!")
         except Exception as e:
             pass
 
@@ -301,6 +302,8 @@ class FastMinecraftBridge:
                     self.is_night = content.get("isNight", False)
                     if "isRaining" in content:
                         self.is_raining = bool(content["isRaining"])
+                    if "nearbyEntities" in content:
+                        self.nearby_entities = content.get("nearbyEntities", [])
 
                     # 2. Periodically scan block volume around fly (every ~1.0s)
                     if iteration % 4 == 0:
@@ -531,6 +534,7 @@ class AerodynamicFlyAgent:
         self.is_grooming: bool = False
         self.grooming_tick: int = 0
         self.grooming_phase_name: str = "Antennae"
+        self.shelter_groom_cooldown: int = 0
         self.is_sleeping: bool = False
         self.in_rear_blind_spot: bool = False
         self.annoyed_jump_ticks: int = 0
@@ -544,18 +548,20 @@ class AerodynamicFlyAgent:
         self.in_saccade: int = 0
         self.saccade_dir: float = 0.0
 
-    def detect_looming_threat(self, px: float, py: float, pz: float) -> Tuple[bool, float]:
+    def detect_looming_threat(self, px: float, py: float, pz: float, nearby_mobs: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, float]:
         """
         Biological Looming Threat Detector (Giant Fiber Reflex):
-        Calculates 3D Euclidean distance, closing speed, and compound eye visual field.
+        Calculates 3D Euclidean distance, closing speed, and compound eye visual field
+        for player and any nearby entities/mobs.
         Real Drosophila have a posterior physical blind spot covering roughly 1/6th
         of their surroundings directly behind them (~60° cone, |rel_angle| > 150°).
-        Approaching from directly behind does NOT trigger the looming escape reflex!
+        Approaching from directly behind does NOT trigger the visual looming escape reflex!
         """
         if self.threat_cooldown > 0:
             self.threat_cooldown -= 1
             return False, 0.0
 
+        # 1. Evaluate Player
         dx = px - self.x
         dy = py - self.y
         dz = pz - self.z
@@ -564,33 +570,61 @@ class AerodynamicFlyAgent:
         self.prev_dist_to_player = dist_3d
 
         angle_to_player = math.degrees(math.atan2(-dx, dz)) % 360.0
-        rel_angle = (angle_to_player - self.yaw + 180.0) % 360.0 - 180.0
+        rel_angle_player = (angle_to_player - self.yaw + 180.0) % 360.0 - 180.0
 
         # Physical rear blind spot covers ~1/6th (60°) directly behind (|rel_angle| > 150°)
-        self.in_rear_blind_spot = (abs(rel_angle) > 150.0 and dist_3d < 4.0)
+        self.in_rear_blind_spot = (abs(rel_angle_player) > 150.0 and dist_3d < 4.0)
 
-        # Looming reflex triggers only if closing fast, nearby, vertically aligned, and NOT in blind spot
-        is_threat = (closing_speed > 0.35 and dist_3d < 3.5 and abs(dy) < 2.5 and not self.in_rear_blind_spot)
+        # Looming reflex triggers if:
+        # 1. Player closing fast (<3.5m, closing > 0.35m/tick)
+        # 2. Player invades immediate perimeter (<2.2m), even if stationary, sheltered, or grooming!
+        is_close_proximity = (dist_3d < 2.2 and abs(dy) < 2.2)
+        is_fast_closing = (closing_speed > 0.35 and dist_3d < 3.5 and abs(dy) < 2.5)
+
+        is_threat = (is_close_proximity or is_fast_closing) and not self.in_rear_blind_spot
+        threat_rel_angle = rel_angle_player
+
+        # 2. Evaluate Nearby Mobs (Zombies, Spiders, Creepers, Animals, etc.)
+        if not is_threat and nearby_mobs:
+            for mob in nearby_mobs:
+                mx = float(mob.get("x", 0.0))
+                my = float(mob.get("y", 0.0))
+                mz = float(mob.get("z", 0.0))
+                # Ignore self / entities at fly origin
+                mob_d3 = math.sqrt((mx - self.x)**2 + (my - self.y)**2 + (mz - self.z)**2)
+                if mob_d3 < 0.20:
+                    continue
+                # Mob within personal perimeter (< 2.2m) triggers startle
+                if mob_d3 < 2.2 and abs(my - self.y) < 2.2:
+                    ang_m = math.degrees(math.atan2(-(mx - self.x), mz - self.z)) % 360.0
+                    rel_m = (ang_m - self.yaw + 180.0) % 360.0 - 180.0
+                    # If in front/sides or within close mechanosensory reach
+                    if abs(rel_m) <= 150.0 or mob_d3 <= 1.4:
+                        is_threat = True
+                        threat_rel_angle = rel_m
+                        break
+
         if is_threat:
-            self.threat_cooldown = 40  # ~2.0s refractory period
-            # If sleeping or grooming, immediately abort and wake up!
-            if self.is_sleeping or self.is_grooming:
-                self.is_sleeping = False
-                self.is_grooming = False
-                self.is_landed = self.is_walking
-                if not self.is_walking:
-                    self.vy = 0.15
+            self.threat_cooldown = 30  # ~1.5s refractory period
+            # If sleeping or grooming, immediately abort and wake/flee!
+            self.is_sleeping = False
+            self.is_grooming = False
+            self.grooming_tick = 0
+            self.shelter_groom_cooldown = 120  # 6s cooldown before grooming can resume
+            self.is_landed = False
+            if not self.is_walking:
+                self.vy = 0.16
 
-            return True, rel_angle
+            return True, threat_rel_angle
 
         return False, 0.0
 
-    def detect_sound_or_touch(self, px: float, py: float, pz: float) -> bool:
+    def detect_sound_or_touch(self, px: float, py: float, pz: float, nearby_mobs: Optional[List[Dict[str, Any]]] = None) -> bool:
         """
         Johnston's Organ & Chordotonal Mechanoreceptors (Sound as Physical Touch):
-        In fruit flies, acoustic vibrations (e.g. footsteps, breaking blocks, note blocks)
-        within 1.5 blocks are perceived as tactile physical touch, triggering an
-        annoyed flinch hop, smoke annoyance puff, and startle flight response.
+        In fruit flies, acoustic vibrations (e.g. footsteps, breaking blocks, note blocks,
+        or mob walking sounds) within 1.5 blocks are perceived as tactile physical touch,
+        triggering an annoyed flinch hop, smoke annoyance puff, and startle flight response.
         """
         if self.annoyed_cooldown > 0:
             self.annoyed_cooldown -= 1
@@ -599,17 +633,31 @@ class AerodynamicFlyAgent:
         dy = py - self.y
         dz = pz - self.z
         dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if dist_3d <= 1.5:
+        min_dist = dist_3d
+
+        if nearby_mobs:
+            for mob in nearby_mobs:
+                mx = float(mob.get("x", 0.0))
+                my = float(mob.get("y", 0.0))
+                mz = float(mob.get("z", 0.0))
+                mdist = math.sqrt((mx - self.x)**2 + (my - self.y)**2 + (mz - self.z)**2)
+                if mdist < 0.20:
+                    continue
+                if mdist < min_dist:
+                    min_dist = mdist
+
+        if min_dist <= 1.5:
             if self.annoyed_jump_ticks <= 0 and self.annoyed_cooldown <= 0:
                 self.annoyed_jump_ticks = 16  # ~0.8s of rapid up-down annoyance oscillation
                 self.annoyed_base_x = self.x
                 self.annoyed_base_y = self.y
                 self.annoyed_base_z = self.z
                 self.annoyed_cooldown = 40    # 2.0s cooldown before next annoyance trigger
-                if self.is_sleeping or self.is_grooming:
-                    self.is_sleeping = False
-                    self.is_grooming = False
-                    self.is_landed = self.is_walking
+                self.is_sleeping = False
+                self.is_grooming = False
+                self.grooming_tick = 0
+                self.shelter_groom_cooldown = 120
+                self.is_landed = False
             return True
         return False
 
@@ -688,37 +736,36 @@ class AerodynamicFlyAgent:
         is_hungry = (self.flight_energy < 50.0)
 
         # -------------------------------------------------------------
+        # 0. IMMEDIATE STARTLE / THREAT / ESCAPE OVERRIDE
+        # -------------------------------------------------------------
+        if is_escape or self.annoyed_jump_ticks > 0:
+            self.is_grooming = False
+            self.grooming_tick = 0
+            self.is_sleeping = False
+            self.shelter_groom_cooldown = 120
+
+        # -------------------------------------------------------------
         # 1. NIGHTTIME CIRCADIAN QUIESCENCE / SLEEP
         # -------------------------------------------------------------
         if is_night and not is_escape and self.annoyed_jump_ticks <= 0:
-            if self.is_walking:
-                self.is_sleeping = True
-                self.vx = self.vy = self.vz = 0.0
-                self.y = ground_y
-                self.pitch = 10.0
-                active_state = "SLEEPING / QUIESCENT (Night Rest)"
-                return self.x, self.y, self.z, self.yaw, self.pitch, active_state
-
-            # Flying mode perching and sleep
             if not self.is_landed:
-                if nearest_perch is not None and nearest_perch[0] < 6.0:
+                # Seek nearest solid perch surface to sleep peacefully
+                if nearest_perch is not None and nearest_perch[0] < 8.0:
                     _, per_x, per_y, per_z = nearest_perch
-                    dx = per_x - self.x
-                    dz = per_z - self.z
-                    pdist = math.hypot(dx, dz)
+                    pdist = math.hypot(per_x - self.x, per_z - self.z)
                     if pdist < 0.6 and abs(self.y - per_y) < 0.5:
                         self.is_landed = True
                         self.is_sleeping = True
                         self.y = per_y + 0.1
                         self.vx = self.vy = self.vz = 0.0
+                        active_state = "SLEEPING / QUIESCENT (Night Rest)"
+                        return self.x, self.y, self.z, self.yaw, self.pitch, active_state
                     else:
-                        self.x += max(-0.06, min(0.06, dx * 0.1))
-                        self.z += max(-0.06, min(0.06, dz * 0.1))
+                        self.x += max(-0.06, min(0.06, (per_x - self.x) * 0.1))
+                        self.z += max(-0.06, min(0.06, (per_z - self.z) * 0.1))
                         self.y += max(-0.05, min(0.05, (per_y - self.y) * 0.1))
                 else:
-                    self.y = max(py - 2.0, self.y - 0.03)
-                    self.vx *= 0.8
-                    self.vz *= 0.8
+                    self.y = max(ground_y + 0.05, self.y - 0.03)
                     if self.y <= ground_y + 0.15:
                         self.is_landed = True
                         self.is_sleeping = True
@@ -745,7 +792,7 @@ class AerodynamicFlyAgent:
         # -------------------------------------------------------------
         shelter_steer = 0.0
         is_seeking_shelter = False
-        if is_raining and not is_escape:
+        if is_raining and not is_escape and self.annoyed_jump_ticks <= 0:
             if not is_sheltered:
                 is_seeking_shelter = True
                 active_state = "SEEKING SHELTER (Rain Pain!)"
@@ -772,14 +819,20 @@ class AerodynamicFlyAgent:
                 self.pitch = 2.0
                 if nearest_shelter is not None:
                     self.y = max(ground_y + 0.25, min(self.y, nearest_shelter[2]))
-                if not self.is_grooming:
+
+                if self.shelter_groom_cooldown > 0:
+                    self.shelter_groom_cooldown -= 1
+                    active_state = "SHELTERED (Resting from Rain)"
+                elif not self.is_grooming and not is_escape and self.annoyed_jump_ticks <= 0:
                     self.is_grooming = True
                     self.grooming_tick = 0
+                else:
+                    active_state = "SHELTERED (Resting from Rain)"
 
         # -------------------------------------------------------------
         # 3. LANDED / STANDING STEREOTYPED 3-STAGE GROOMING
         # -------------------------------------------------------------
-        if self.is_grooming:
+        if self.is_grooming and not is_escape and self.annoyed_jump_ticks <= 0:
             self.grooming_tick += 1
             self.flight_energy = min(100.0, self.flight_energy + 1.5)
             self.vx = self.vy = self.vz = 0.0
@@ -811,10 +864,12 @@ class AerodynamicFlyAgent:
                 self.is_landed = self.is_walking
                 self.grooming_tick = 0
                 self.flight_energy = 100.0
+                if is_raining and is_sheltered:
+                    self.shelter_groom_cooldown = random.randint(250, 450)
                 if not self.is_walking:
                     self.vy = 0.0 if (is_raining and is_sheltered) else 0.08
                 self.pitch = 0.0
-                active_state = "SHELTERED (Safe from Rain)" if (is_raining and is_sheltered) else "FORAGING"
+                active_state = "SHELTERED (Resting from Rain)" if (is_raining and is_sheltered) else "FORAGING"
 
             return self.x, self.y, self.z, self.yaw, self.pitch, active_state
 
@@ -1347,10 +1402,17 @@ def main():
             is_feeding = (food_valence > 0.0 and food_dist < 2.2)
 
             # 3. Check for Looming Threat (respecting 60° rear blind spot) & Johnston's Organ
-            is_threat, threat_rel_angle = flight.detect_looming_threat(px, py, pz)
-            is_sound_touch = flight.detect_sound_or_touch(px, py, pz)
+            is_threat, threat_rel_angle = flight.detect_looming_threat(px, py, pz, bridge.nearby_entities)
+            is_sound_touch = flight.detect_sound_or_touch(px, py, pz, bridge.nearby_entities)
 
-            if (is_threat or is_sound_touch or (food_valence > 0.0 and food_dist < 2.2)) and flight.is_sleeping:
+            if is_threat or is_sound_touch:
+                flight.is_sleeping = False
+                flight.is_grooming = False
+                flight.grooming_tick = 0
+                flight.shelter_groom_cooldown = 120
+                flight.is_landed = False
+                snn.set_circadian_phase(is_night=False)
+            elif (food_valence > 0.0 and food_dist < 2.2) and flight.is_sleeping:
                 flight.is_sleeping = False
                 flight.is_landed = flight.is_walking
                 snn.set_circadian_phase(is_night=False)
