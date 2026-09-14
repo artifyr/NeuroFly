@@ -212,6 +212,61 @@ def test_mob_threat_and_shelter_grooming_escape():
     print("[PASS] Mob threat & shelter grooming escape verified successfully!\n")
 
 
+def test_sleep_only_on_solid_blocks():
+    print("=== Testing Night Sleep Strictly on Solid Blocks (Not in Air) ===")
+    agent = AerodynamicFlyAgent(0.0, 20.0, 0.0, is_walking=False)
+    agent.x = 0.0
+    agent.y = 20.0
+    agent.z = 0.0
+
+    # 1. Airborne at night without solid perch -> Must NOT sleep, must seek perch!
+    _, _, _, _, _, state_air = agent.step_behavior_and_physics(
+        turn_signal=0.0, forward_signal=0.0, learned_steer=0.0,
+        px=0.0, py=20.0, pz=0.0, tick=1, ground_y=0.0,
+        is_night=True, nearest_perch=None
+    )
+    assert agent.is_sleeping is False, "Fly must NOT sleep while airborne in mid-air!"
+    assert state_air == "SLEEPING (Seeking Perch)", f"Expected seeking perch, got '{state_air}'"
+
+    # 2. Resting on top of solid perch (surface at y=5.0, fly at y=5.1) -> Enters Quiescent Sleep
+    agent.y = 5.1
+    nearest_perch = (0.2, 0.0, 5.0, 0.0)  # (dist, x, top_y, z)
+    _, _, _, _, _, state_perch = agent.step_behavior_and_physics(
+        turn_signal=0.0, forward_signal=0.0, learned_steer=0.0,
+        px=0.0, py=5.0, pz=0.0, tick=2, ground_y=0.0,
+        is_night=True, nearest_perch=nearest_perch
+    )
+    assert agent.is_sleeping is True, "Fly should sleep when touching down on solid perch!"
+    assert state_perch == "SLEEPING / QUIESCENT (Night Rest)", f"Expected quiescent sleep, got '{state_perch}'"
+    print("[PASS] Night sleep strictly on solid blocks verified successfully!\n")
+
+
+def test_music_and_mob_annoyance():
+    print("=== Testing Annoyance Triggered Only by Music or Mobs Within 1.5 Blocks ===")
+    agent = AerodynamicFlyAgent(0.0, 5.0, 0.0, is_walking=False)
+    agent.x = 0.0
+    agent.y = 5.0
+    agent.z = 0.0
+
+    # 1. Music sound triggers annoyance
+    agent.annoyed_cooldown = 0
+    disturbed_music = agent.detect_sound_or_touch(is_music_playing=True)
+    assert disturbed_music is True, "Music playing should trigger chordotonal annoyance!"
+
+    # 2. Mob within 1.5 blocks triggers annoyance
+    agent.annoyed_cooldown = 0
+    nearby_mobs = [{"id": 10, "type": "creeper", "x": 0.5, "y": 5.0, "z": 0.5}]
+    disturbed_mob = agent.detect_sound_or_touch(is_music_playing=False, nearby_mobs=nearby_mobs)
+    assert disturbed_mob is True, "Mob within 1.5m should trigger annoyance!"
+
+    # 3. No music and no close mob -> Does NOT trigger annoyance
+    agent.annoyed_cooldown = 0
+    distant_mobs = [{"id": 11, "type": "cow", "x": 5.0, "y": 5.0, "z": 5.0}]
+    disturbed_none = agent.detect_sound_or_touch(is_music_playing=False, nearby_mobs=distant_mobs)
+    assert disturbed_none is False, "No music and distant mobs must NOT trigger annoyance!"
+    print("[PASS] Annoyance specificity (Music & Mobs <= 1.5m) verified successfully!\n")
+
+
 if __name__ == "__main__":
     test_rear_blind_spot()
     test_johnstons_organ_sound_touch()
@@ -219,5 +274,8 @@ if __name__ == "__main__":
     test_rain_avoidance()
     test_two_line_hud_lengths()
     test_mob_threat_and_shelter_grooming_escape()
-    print("ALL 6 VERIFICATION TESTS PASSED PERFECTLY!")
+    test_sleep_only_on_solid_blocks()
+    test_music_and_mob_annoyance()
+    print("ALL 8 VERIFICATION TESTS PASSED PERFECTLY!")
+
 

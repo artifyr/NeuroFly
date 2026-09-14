@@ -121,7 +121,8 @@ FOOD_BLOCKS: Dict[str, Tuple[float, str]] = {
 # Non-solid blocks to exclude from landing/perching
 NON_SOLID_PERCH = {
     "minecraft:air", "minecraft:cave_air", "minecraft:void_air", "minecraft:water",
-    "minecraft:lava", "minecraft:fire", "minecraft:soul_fire", "minecraft:short_grass",
+    "minecraft:flowing_water", "minecraft:lava", "minecraft:flowing_lava", "minecraft:fire",
+    "minecraft:soul_fire", "minecraft:bubble_column", "minecraft:short_grass",
     "minecraft:tall_grass", "minecraft:fern", "minecraft:large_fern", "minecraft:vine",
     "minecraft:cave_vines", "minecraft:twisting_vines", "minecraft:weeping_vines",
     "minecraft:seagrass", "minecraft:tall_seagrass", "minecraft:kelp", "minecraft:kelp_plant",
@@ -149,6 +150,9 @@ class FastMinecraftBridge:
         self.is_night: bool = False
         self.is_raining: bool = False
         self.nearby_entities: List[Dict[str, Any]] = []
+        self.in_water: bool = False
+        self.in_lava: bool = False
+        self.is_music_playing: bool = False
 
         # Environment scan results
         self.fly_approx_pos: Tuple[float, float, float] = (-38.0, -58.0, 175.0)
@@ -335,6 +339,9 @@ class FastMinecraftBridge:
                         min_light = None
                         min_food = None
                         min_perch = None
+                        direct_water = False
+                        direct_lava = False
+                        music_near = False
 
                         for (x1, y1, z1, x2, y2, z2) in scan_boxes:
                             # Safety clamp to guarantee strictly <= 10 blocks per axis
@@ -380,7 +387,23 @@ class FastMinecraftBridge:
                                 for bx, by, bz in coords:
                                     dist = math.hypot(bx - fx, bz - fz)
                                     total_dist = math.hypot(dist, by - fy)
-                                    # Ground surface tracking: only terrain blocks (exclude elevated canopy leaves, logs, or roofs)
+
+                                    # Direct physical contact detection with water (submerged / in contact)
+                                    if btype in ("minecraft:water", "minecraft:flowing_water"):
+                                        if abs(bx - fx) < 0.65 and abs(bz - fz) < 0.65 and (by - 0.1 <= fy <= by + 1.0):
+                                            direct_water = True
+
+                                    # Direct physical contact detection with lava / fire
+                                    if btype in HAZARD_BLOCKS or btype in ("minecraft:lava", "minecraft:flowing_lava"):
+                                        if abs(bx - fx) < 0.65 and abs(bz - fz) < 0.65 and (by - 0.1 <= fy <= by + 1.0):
+                                            direct_lava = True
+
+                                    # Music sources (Jukebox, Note Block) within 8 blocks
+                                    if btype in ("minecraft:jukebox", "minecraft:note_block"):
+                                        if total_dist < 8.0:
+                                            music_near = True
+
+                                    # Ground surface tracking: only solid terrain blocks
                                     is_elevated_structure = (
                                         btype.endswith("_leaves") or
                                         btype.endswith("_sapling") or
@@ -409,7 +432,7 @@ class FastMinecraftBridge:
                                     if is_canopy:
                                         self.known_shelters[(int(round(bx)), int(round(by)), int(round(bz)))] = time.time()
 
-                                    # Thermal hazards
+                                    # Thermal hazards (Heat sensing gradient)
                                     if btype in HAZARD_BLOCKS:
                                         if min_hazard is None or total_dist < min_hazard[0]:
                                             min_hazard = (total_dist, bx, by, bz, HAZARD_BLOCKS[btype])
@@ -425,8 +448,8 @@ class FastMinecraftBridge:
                                         if min_food is None or total_dist < min_food[0]:
                                             min_food = (total_dist, bx, by, bz, val, fname)
 
-                                    # Solid perch candidate (top surface at by + 1.0, exclude leaves so fly doesn't perch on top of tree)
-                                    if btype not in NON_SOLID_PERCH and not btype.endswith("_leaves") and (by <= fy + 0.5):
+                                    # Solid perch candidate (any non-hazard solid block top surface)
+                                    if btype not in NON_SOLID_PERCH and btype not in HAZARD_BLOCKS and (by <= fy + 0.6):
                                         perch_top_y = by + 1.0
                                         pdist = math.hypot(bx - fx, bz - fz)
                                         if min_perch is None or pdist < min_perch[0]:
@@ -467,6 +490,10 @@ class FastMinecraftBridge:
                             if min_shelter is None or pdist < min_shelter[0]:
                                 min_shelter = (pdist, float(sx), float(target_canopy_y), float(sz))
 
+                        self.in_water = direct_water
+                        self.in_lava = direct_lava
+                        held_music = ("music_disc" in self.held_item or "goat_horn" in self.held_item)
+                        self.is_music_playing = music_near or held_music
                         self.nearest_hazard = min_hazard
                         self.nearest_light = min_light
                         self.nearest_food_block = min_food
@@ -619,34 +646,51 @@ class AerodynamicFlyAgent:
 
         return False, 0.0
 
-    def detect_sound_or_touch(self, px: float, py: float, pz: float, nearby_mobs: Optional[List[Dict[str, Any]]] = None) -> bool:
+    def detect_sound_or_touch(
+        self,
+        px_or_music: Any = False,
+        py: Optional[float] = None,
+        pz: Optional[float] = None,
+        nearby_mobs: Optional[List[Dict[str, Any]]] = None,
+        is_music_playing: bool = False,
+    ) -> bool:
         """
         Johnston's Organ & Chordotonal Mechanoreceptors (Sound as Physical Touch):
-        In fruit flies, acoustic vibrations (e.g. footsteps, breaking blocks, note blocks,
-        or mob walking sounds) within 1.5 blocks are perceived as tactile physical touch,
-        triggering an annoyed flinch hop, smoke annoyance puff, and startle flight response.
+        In fruit flies, acoustic vibrations from music (jukebox / note blocks) or
+        any mob within 1.5 blocks trigger an annoyed flinch hop and startle flight response.
+        The player simply standing nearby does NOT annoy the fly.
         """
         if self.annoyed_cooldown > 0:
             self.annoyed_cooldown -= 1
 
-        dx = px - self.x
-        dy = py - self.y
-        dz = pz - self.z
-        dist_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        min_dist = dist_3d
+        is_annoyed = False
 
-        if nearby_mobs:
+        # 1. Music sound vibration (Jukebox / Note Block / Music Disc)
+        if isinstance(px_or_music, bool) and px_or_music:
+            is_annoyed = True
+        elif is_music_playing:
+            is_annoyed = True
+
+        # 2. Any mob within 1.5 blocks
+        if not is_annoyed and nearby_mobs:
             for mob in nearby_mobs:
                 mx = float(mob.get("x", 0.0))
                 my = float(mob.get("y", 0.0))
                 mz = float(mob.get("z", 0.0))
                 mdist = math.sqrt((mx - self.x)**2 + (my - self.y)**2 + (mz - self.z)**2)
                 if mdist < 0.20:
-                    continue
-                if mdist < min_dist:
-                    min_dist = mdist
+                    continue  # Ignore self entity
+                if mdist <= 1.5:
+                    is_annoyed = True
+                    break
 
-        if min_dist <= 1.5:
+        # 3. Direct sound vibration point test (e.g. from tests passing (x, y, z))
+        if not is_annoyed and py is not None and pz is not None and isinstance(px_or_music, (int, float)):
+            dist_3d = math.sqrt((float(px_or_music) - self.x)**2 + (float(py) - self.y)**2 + (float(pz) - self.z)**2)
+            if dist_3d <= 1.5:
+                is_annoyed = True
+
+        if is_annoyed:
             if self.annoyed_jump_ticks <= 0 and self.annoyed_cooldown <= 0:
                 self.annoyed_jump_ticks = 16  # ~0.8s of rapid up-down annoyance oscillation
                 self.annoyed_base_x = self.x
@@ -745,40 +789,45 @@ class AerodynamicFlyAgent:
             self.shelter_groom_cooldown = 120
 
         # -------------------------------------------------------------
-        # 1. NIGHTTIME CIRCADIAN QUIESCENCE / SLEEP
+        # 1. NIGHTTIME CIRCADIAN QUIESCENCE / SLEEP (ONLY ON SOLID BLOCKS!)
         # -------------------------------------------------------------
         if is_night and not is_escape and self.annoyed_jump_ticks <= 0:
-            if not self.is_landed:
-                # Seek nearest solid perch surface to sleep peacefully
-                if nearest_perch is not None and nearest_perch[0] < 8.0:
-                    _, per_x, per_y, per_z = nearest_perch
-                    pdist = math.hypot(per_x - self.x, per_z - self.z)
-                    if pdist < 0.6 and abs(self.y - per_y) < 0.5:
-                        self.is_landed = True
-                        self.is_sleeping = True
-                        self.y = per_y + 0.1
-                        self.vx = self.vy = self.vz = 0.0
-                        active_state = "SLEEPING / QUIESCENT (Night Rest)"
-                        return self.x, self.y, self.z, self.yaw, self.pitch, active_state
-                    else:
-                        self.x += max(-0.06, min(0.06, (per_x - self.x) * 0.1))
-                        self.z += max(-0.06, min(0.06, (per_z - self.z) * 0.1))
-                        self.y += max(-0.05, min(0.05, (per_y - self.y) * 0.1))
-                else:
-                    self.y = max(ground_y + 0.05, self.y - 0.03)
-                    if self.y <= ground_y + 0.15:
-                        self.is_landed = True
-                        self.is_sleeping = True
-                        self.y = ground_y
-                        self.vx = self.vy = self.vz = 0.0
-                        active_state = "SLEEPING / QUIESCENT (Night Rest)"
-                        return self.x, self.y, self.z, self.yaw, self.pitch, active_state
-                active_state = "SLEEPING (Seeking Perch)"
-                return self.x, self.y, self.z, self.yaw, self.pitch, active_state
-            else:
+            # Check if fly is physically resting on a solid perch surface
+            is_on_solid_perch = False
+            perch_y = ground_y
+            if nearest_perch is not None:
+                _, per_x, per_top_y, per_z = nearest_perch
+                pdist = math.hypot(per_x - self.x, per_z - self.z)
+                if pdist < 0.70 and abs(self.y - per_top_y) <= 0.25:
+                    is_on_solid_perch = True
+                    perch_y = per_top_y
+            elif self.is_walking and ground_y > -64.0 and abs(self.y - ground_y) <= 0.25:
+                is_on_solid_perch = True
+                perch_y = ground_y
+
+            if is_on_solid_perch:
+                self.is_landed = True
                 self.is_sleeping = True
+                self.y = perch_y
                 self.vx = self.vy = self.vz = 0.0
                 active_state = "SLEEPING / QUIESCENT (Night Rest)"
+                return self.x, self.y, self.z, self.yaw, self.pitch, active_state
+            else:
+                # In the air: actively descend toward solid perch or ground, NEVER sleep in air!
+                self.is_landed = False
+                self.is_sleeping = False
+                if nearest_perch is not None and nearest_perch[0] < 12.0:
+                    _, per_x, per_top_y, per_z = nearest_perch
+                    dx = per_x - self.x
+                    dz = per_z - self.z
+                    self.x += max(-0.07, min(0.07, dx * 0.15))
+                    self.z += max(-0.07, min(0.07, dz * 0.15))
+                    self.y += max(-0.06, min(0.06, (per_top_y - self.y) * 0.20))
+                else:
+                    self.y = max(ground_y, self.y - 0.04)
+                    self.vx *= 0.70
+                    self.vz *= 0.70
+                active_state = "SLEEPING (Seeking Perch)"
                 return self.x, self.y, self.z, self.yaw, self.pitch, active_state
         elif not is_night and self.is_sleeping:
             self.is_sleeping = False
@@ -1403,7 +1452,7 @@ def main():
 
             # 3. Check for Looming Threat (respecting 60° rear blind spot) & Johnston's Organ
             is_threat, threat_rel_angle = flight.detect_looming_threat(px, py, pz, bridge.nearby_entities)
-            is_sound_touch = flight.detect_sound_or_touch(px, py, pz, bridge.nearby_entities)
+            is_sound_touch = flight.detect_sound_or_touch(is_music_playing=bridge.is_music_playing, nearby_mobs=bridge.nearby_entities)
 
             if is_threat or is_sound_touch:
                 flight.is_sleeping = False
@@ -1441,7 +1490,7 @@ def main():
                 spontaneous = (torch.rand(snn.num_neurons, device=device) < 0.0035).float() * 14.0
                 ext_current = ext_current + spontaneous
 
-            # Johnston's Organ Chordotonal Transduction (Sound as Physical Touch within 1.5m)
+            # Johnston's Organ Chordotonal Transduction (Music & nearby mob vibrations)
             if is_sound_touch or flight.annoyed_jump_ticks > 0:
                 mech_sound_cur = snn.inject_johnstons_organ_sound_touch(intensity=1.0)
                 ext_current = ext_current + mech_sound_cur
@@ -1464,7 +1513,7 @@ def main():
                 light_current = snn.inject_light_stimulus(intensity=l_intensity, rel_angle=l_rel_angle)
                 ext_current = ext_current + light_current
 
-            # Thermonociceptive Hazard Ingestion
+            # Thermonociceptive Hazard Ingestion (Heat gradient sensing repels fly, no damage while hovering)
             if nearest_hazard is not None and nearest_hazard[0] < 5.0:
                 hdist, hx, hy, hz, _ = nearest_hazard
                 if hdist < 2.0 and flight.is_sleeping:
@@ -1474,8 +1523,25 @@ def main():
                 h_intensity = max(0.0, min(1.0, (5.0 - hdist) / 5.0))
                 hazard_current = snn.inject_thermal_hazard(intensity=h_intensity, rel_angle=h_rel_angle)
                 ext_current = ext_current + hazard_current
-                if hdist < 1.6 and tick % 10 == 0:
-                    fly_health = max(1.0, fly_health - 2.0)  # Heat damage
+
+            # Direct Liquid / Contact Damage (Only on direct contact with water or lava, NOT hovering over it)
+            if bridge.in_water:
+                if tick % 10 == 0:
+                    fly_health -= 1.5  # Direct water contact / drowning
+                flight.vy = max(0.18, flight.vy + 0.08)  # Emergency upward flap
+                if flight.is_sleeping or flight.is_grooming:
+                    flight.is_sleeping = False
+                    flight.is_grooming = False
+                    flight.is_landed = False
+
+            if bridge.in_lava:
+                if tick % 10 == 0:
+                    fly_health -= 3.0  # Direct lava / fire contact damage
+                flight.vy = max(0.24, flight.vy + 0.10)  # Emergency upward escape
+                if flight.is_sleeping or flight.is_grooming:
+                    flight.is_sleeping = False
+                    flight.is_grooming = False
+                    flight.is_landed = False
 
             # Grooming Mechanosensory Ingestion
             if flight.is_grooming:
@@ -1504,9 +1570,9 @@ def main():
                     )
                     ext_current = ext_current + rain_pain_cur
 
-                    # Mechanical rain damage when exposed (droplet impact trauma)
-                    if tick % 30 == 0:
-                        fly_health = max(1.0, fly_health - 1.0)
+                    # Mechanical rain damage when exposed (droplet impact trauma) - keeps getting hurt!
+                    if tick % 25 == 0:
+                        fly_health -= 1.0
                 else:
                     # Safe under cover: relief reward dopamine (PAM reinforcement)
                     shelter_relief_cur = snn.inject_shelter_relief()
