@@ -188,7 +188,7 @@ class FastMinecraftBridge:
             t0 = time.perf_counter()
             self._call("tools/call", {
                 "name": "execute_commands",
-                "arguments": {"commands": ["tp @e[type=bee,limit=1] ~ ~ ~"]},
+                "arguments": {"commands": ["tp @a ~ ~ ~"]},
             })
             dt = (time.perf_counter() - t0) * 1000.0
             import os
@@ -1182,11 +1182,14 @@ def main():
                 + f"{{CustomName:'\"{name_str}\"',CustomNameVisible:1b,NoGravity:1b,Invulnerable:1b,PersistenceRequired:1b,Tags:[\"fly_brain_active\"]}}"
             )
 
-    # Clean despawn any old entities and spawn model
+    # Clean despawn any old entities, check if active entity exists, and summon exactly one
     bridge.execute([
         "tp @e[tag=fly_brain_active] ~ -300 ~",
         "tp @e[type=bee] ~ -300 ~",
         "tp @e[type=villager,tag=fly_brain_active] ~ -300 ~",
+    ])
+    time.sleep(0.05)
+    bridge.execute([
         make_summon_cmd(flight.x, flight.y, flight.z),
         f"effect clear @e[type={entity_type},tag=fly_brain_active]",
         f'title @a actionbar [{{"text":"[FlyBrain] ","color":"gold","bold":true}},{{"text":"{entity_type.capitalize()} ({mode_str.capitalize()}) Active!","color":"green"}}]'

@@ -152,7 +152,7 @@ class FastMinecraftBridge:
             t0 = time.perf_counter()
             self._call("tools/call", {
                 "name": "execute_commands",
-                "arguments": {"commands": ["tp @e[type=bee,limit=1] ~ ~ ~"]},
+                "arguments": {"commands": ["tp @a ~ ~ ~"]},
             })
             dt = (time.perf_counter() - t0) * 1000.0
             if dt > 100.0:
@@ -696,9 +696,13 @@ class MinecraftFlyBridge:
     def spawn_entity_in_minecraft(self) -> None:
         if self.flight is None:
             return
-        cmds = [
+        # Despawn previous entities first, then summon exactly one
+        self.bridge.execute([
             "tp @e[tag=fly_brain_active] ~ -300 ~",
             "tp @e[type=bee] ~ -300 ~",
+        ])
+        time.sleep(0.05)
+        cmds = [
             self.make_summon_command(self.flight.x, self.flight.y, self.flight.z),
             f"effect clear @e[type={self.entity_type},tag=fly_brain_active]",
             f'title @a actionbar [{{"text":"[FlyBrain] ","color":"gold","bold":true}},{{"text":"{self.entity_type.capitalize()} Brain Embodying!","color":"green"}}]',
