@@ -1090,7 +1090,7 @@ def main():
     parser = argparse.ArgumentParser(description="FlyAI: Complete Biological Connectome Fly Agent.")
     parser.add_argument("--connectome-csv", type=str, default="data/connections_princeton.csv", help="Connections CSV")
     parser.add_argument("--annotations-csv", type=str, default="data/classification.csv", help="Annotations CSV")
-    parser.add_argument("--device", type=str, default="cuda", help="Target compute device")
+    parser.add_argument("--device", type=str, default="auto", help="Target compute device ('auto', 'cuda', 'hip', 'mps', 'cpu')")
     parser.add_argument("--ticks", type=int, default=None, help="Number of ticks (default: run indefinitely)")
     parser.add_argument("--entity", type=str, default="bee", choices=["villager", "bee"], help="Entity model to embody (bee or villager)")
     parser.add_argument("--baby", action="store_true", default=False, help="Spawn as baby villager model")
@@ -1106,14 +1106,16 @@ def main():
     is_walking = args.walk or (entity_type == "villager" and not getattr(args, "fly", False))
     mode_str = "WALKING" if is_walking else "FLYING"
 
-    # 1. GPU / ROCm Target
+    # 1. Hardware Detection & Acceleration
     device = get_device(args.device)
     info = get_device_info(device)
     print("=" * 70)
     print(f"FlyAI: Biological Drosophila Connectome Agent [{entity_type.upper()} {mode_str}]")
     print("=" * 70)
-    print(f"Device Target   : {info.get('selected_device')} ({info.get('device_name', 'CPU')})")
-    print(f"ROCm Active     : {info.get('is_rocm')} (HIP: {info.get('rocm_version')})")
+    print(f"Processor/GPU   : {info.get('accelerator_type')} - {info.get('device_name', 'Unknown')}")
+    print(f"Device Target   : {info.get('selected_device')} (PyTorch {info.get('pytorch_version')})")
+    if info.get('is_rocm'):
+        print(f"ROCm HIP Active : True (HIP {info.get('rocm_version')})")
 
     # 2. Ingest FAFB Connectome into GPU VRAM
     print(f"Loading FAFB connectome from {args.connectome_csv}...")

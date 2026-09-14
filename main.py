@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="localhost", help="WebSocket bind host (default: localhost)")
     parser.add_argument("--port", type=int, default=8765, help="WebSocket bind port (default: 8765)")
-    parser.add_argument("--device", type=str, default="cuda", help="Compute device ('cuda', 'hip', or 'cpu')")
+    parser.add_argument("--device", type=str, default="auto", help="Compute device ('auto', 'cuda', 'hip', 'mps', or 'cpu')")
     parser.add_argument("--connectome-csv", type=str, default=None, help="Path to FAFB edges CSV file")
     parser.add_argument("--annotations-csv", type=str, default=None, help="Path to neuron annotations CSV file")
     parser.add_argument("--num-visual", type=int, default=64, help="Visual input neurons for synthetic circuit")
