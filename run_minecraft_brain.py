@@ -307,29 +307,33 @@ class FastMinecraftBridge:
                         fx, fy, fz = self.fly_approx_pos
 
                         # Determine scan boxes adhering strictly to MCP limit (<= 10 blocks per axis!)
-                        # We use 9x9x9 boxes. In rain, rotate through sectors to discover distant canopies.
-                        scan_offsets = [(0, 0)]
+                        # We perform a dual-box scan: Ground-to-low-canopy (Box 1) and High-canopy (Box 2)
+                        # to ensure full tree heights (oak, spruce, birch, mangrove up to 16 blocks high) are discovered.
+                        scan_boxes = [
+                            # Box 1: Immediate surroundings & low canopy
+                            (int(round(fx - 4)), int(round(fy - 2)), int(round(fz - 4)),
+                             int(round(fx + 4)), int(round(fy + 7)), int(round(fz + 4))),
+                            # Box 2: High canopy directly overhead
+                            (int(round(fx - 4)), int(round(fy + 7)), int(round(fz - 4)),
+                             int(round(fx + 4)), int(round(fy + 16)), int(round(fz + 4))),
+                        ]
+
+                        # In rain, also alternate scanning horizontal offset sectors to discover distant trees
                         if self.is_raining:
-                            quad = (iteration // 4) % 5
-                            if quad == 1:
-                                scan_offsets = [(5, 0)]
-                            elif quad == 2:
-                                scan_offsets = [(-5, 0)]
-                            elif quad == 3:
-                                scan_offsets = [(0, 5)]
-                            elif quad == 4:
-                                scan_offsets = [(0, -5)]
+                            quad = (iteration // 4) % 4
+                            ox = 6 if quad == 0 else (-6 if quad == 1 else 0)
+                            oz = 6 if quad == 2 else (-6 if quad == 3 else 0)
+                            scan_boxes.append((
+                                int(round(fx + ox - 4)), int(round(fy - 2)), int(round(fz + oz - 4)),
+                                int(round(fx + ox + 4)), int(round(fy + 7)), int(round(fz + oz + 4)),
+                            ))
 
                         min_hazard = None
                         min_light = None
                         min_food = None
                         min_perch = None
 
-                        for ox, oz in scan_offsets:
-                            cx, cz = fx + ox, fz + oz
-                            x1, y1, z1 = int(round(cx - 4)), int(round(fy - 2)), int(round(cz - 4))
-                            x2, y2, z2 = int(round(cx + 4)), int(round(fy + 6)), int(round(cz + 4))
-
+                        for (x1, y1, z1, x2, y2, z2) in scan_boxes:
                             # Safety clamp to guarantee strictly <= 10 blocks per axis
                             if x2 - x1 >= 10:
                                 x2 = x1 + 9
@@ -381,8 +385,18 @@ class FastMinecraftBridge:
                                         if (ix, iz) not in self.heightmap or top_y > self.heightmap[(ix, iz)]:
                                             self.heightmap[(ix, iz)] = top_y
 
-                                        # Shelter & Canopy tracking (overhead solid block / tree leaves / logs)
-                                        if by > fy + 0.6:
+                                        # Canopy / shelter detection: tree leaves, logs, wood, roofs, building blocks
+                                        is_canopy = (
+                                            btype.endswith("_leaves") or
+                                            btype.endswith("_log") or
+                                            btype.endswith("_wood") or
+                                            btype.endswith("_planks") or
+                                            btype.endswith("_slab") or
+                                            btype.endswith("_stairs") or
+                                            "roof" in btype or
+                                            (btype not in NON_SOLID_PERCH and not btype.endswith("_flower") and by >= fy + 0.3)
+                                        )
+                                        if is_canopy:
                                             self.known_shelters[(int(round(bx)), int(round(by)), int(round(bz)))] = time.time()
 
                                     # Thermal hazards
@@ -414,16 +428,33 @@ class FastMinecraftBridge:
                         for k in stale_keys:
                             self.known_shelters.pop(k, None)
 
-                        # Determine if fly is currently sheltered and find nearest shelter
+                        # Group canopy blocks by horizontal column (bx, bz)
+                        col_canopies: Dict[Tuple[int, int], List[int]] = {}
+                        for (sx, sy, sz) in self.known_shelters.keys():
+                            col_canopies.setdefault((sx, sz), []).append(sy)
+
                         is_sheltered = False
                         min_shelter = None
-                        for (sx, sy, sz) in self.known_shelters.keys():
+                        overhead_min_y = None
+
+                        # Check if fly is under any canopy column within 1.85m horizontal distance
+                        for (sx, sz), y_list in col_canopies.items():
                             pdist = math.hypot(sx - fx, sz - fz)
-                            # Direct overhead check: block is directly above fly (by > fy + 0.5) and within 1.35m horizontal
-                            if pdist < 1.35 and sy > fy + 0.5:
+                            # Overhead canopy blocks in this column
+                            overhead_in_col = [y for y in y_list if y >= fy + 0.15]
+                            if pdist <= 1.85 and overhead_in_col:
                                 is_sheltered = True
+                                lowest_overhead = min(overhead_in_col)
+                                if overhead_min_y is None or lowest_overhead < overhead_min_y:
+                                    overhead_min_y = lowest_overhead
+
+                        # Compute nearest shelter target: targets underside of nearest canopy
+                        for (sx, sz), y_list in col_canopies.items():
+                            pdist = math.hypot(sx - fx, sz - fz)
+                            lowest_y = min(y_list)
+                            target_canopy_y = max(lowest_y - 0.5, self.get_ground_y(sx, sz, fy) + 0.3)
                             if min_shelter is None or pdist < min_shelter[0]:
-                                min_shelter = (pdist, float(sx), float(sy) - 0.4, float(sz))
+                                min_shelter = (pdist, float(sx), float(target_canopy_y), float(sz))
 
                         self.nearest_hazard = min_hazard
                         self.nearest_light = min_light
@@ -727,11 +758,13 @@ class AerodynamicFlyAgent:
             else:
                 # Under safe overhead cover (tree leaf canopy, cave roof, or building ceiling)
                 active_state = "SHELTERED (Safe from Rain)"
-                self.vx *= 0.40
-                self.vz *= 0.40
+                self.vx *= 0.20
+                self.vz *= 0.20
                 self.vy = 0.0
                 self.pitch = 2.0
-                if not self.is_grooming and random.random() < 0.06:
+                if nearest_shelter is not None:
+                    self.y = max(ground_y + 0.25, min(self.y, nearest_shelter[2]))
+                if not self.is_grooming:
                     self.is_grooming = True
                     self.grooming_tick = 0
 
